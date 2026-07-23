@@ -7,7 +7,7 @@ This public repository contains only a sanitized external availability monitor f
 - Never commit credentials, webhook URLs, hostnames, IP addresses, private repository contents, broker data, account data, or operational dashboards.
 - GitHub Actions secrets are write-only runtime inputs and must never be printed.
 - The external workflow may read and update only this repository's heartbeat issue and send a bounded Discord alert.
-- The Sable publisher may update only the heartbeat comment after the local self-hosted CI watchdog reports healthy.
+- The trusted heartbeat publisher may update only the heartbeat comment after the local self-hosted CI watchdog reports healthy.
 - No IBKR, broker, order, sizing, Risk Gate, execution, deployment, Docker-socket, SSH, or performance-truth authority exists here.
 - Do not add `pull_request_target` or expose secrets to pull-request workflows.
 

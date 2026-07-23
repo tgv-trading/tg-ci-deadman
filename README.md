@@ -2,7 +2,7 @@
 
 Public, sanitized dead-man monitoring for the Terminal Gravity self-hosted CI runner.
 
-A trusted publisher updates one exact, identity-bound heartbeat comment only after a watchdog probe from the same invocation reports healthy. A GitHub-hosted scheduled workflow, independent of the self-hosted machine, validates the exact heartbeat schema and alerts a bounded Discord webhook when the heartbeat is stale or malformed. It announces recovery when the heartbeat becomes healthy again. Alert deduplication state lives in one message owned by the same scoped webhook, so the workflow's GitHub token remains read-only.
+A trusted publisher updates one exact, identity-bound heartbeat comment only after a watchdog probe from the same invocation reports healthy with a matching cryptographic nonce attestation. A GitHub-hosted scheduled workflow, independent of the self-hosted machine, validates the exact heartbeat schema and alerts a bounded Discord webhook when the heartbeat is stale or malformed. It announces recovery when the heartbeat becomes healthy again. Alert deduplication state lives in one message owned by the same scoped webhook, so the workflow's GitHub token remains read-only.
 
 ## Boundaries
 

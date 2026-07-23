@@ -24,7 +24,6 @@ DISCORD_STATE_MARKER = "Terminal Gravity CI dead-man state"
 STATE_SCHEMA = "tg_ci_deadman_state_v2"
 STATE_KEYS = {"last_alert_epoch", "last_check_epoch", "schema", "status"}
 MAX_HEARTBEAT_AGE_SECONDS = 20 * 60
-MAX_FUTURE_SKEW_SECONDS = 5 * 60
 REPEAT_ALERT_SECONDS = 6 * 60 * 60
 
 
@@ -105,8 +104,8 @@ def assess_heartbeat(payload: dict[str, Any], now: int) -> tuple[str, int]:
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
         raise ValueError("heartbeat epoch invalid")
     age = now - epoch
-    if age < -MAX_FUTURE_SKEW_SECONDS:
-        return "heartbeat timestamp is in the future", age
+    if age < 0:
+        return f"heartbeat timestamp is {-age} seconds in the future", age
     if age > MAX_HEARTBEAT_AGE_SECONDS:
         return f"heartbeat stale by {age} seconds", age
     return "", age
@@ -192,7 +191,7 @@ def normalize_state(payload: dict[str, Any], now: int) -> dict[str, Any]:
         isinstance(last_check, bool)
         or not isinstance(last_check, int)
         or last_check <= 0
-        or last_check > now + MAX_FUTURE_SKEW_SECONDS
+        or last_check > now
     ):
         raise ValueError("dead-man last-check timestamp invalid")
     if (
@@ -200,7 +199,7 @@ def normalize_state(payload: dict[str, Any], now: int) -> dict[str, Any]:
         or not isinstance(last_alert, int)
         or last_alert < 0
         or last_alert > last_check
-        or last_alert > now + MAX_FUTURE_SKEW_SECONDS
+        or last_alert > now
     ):
         raise ValueError("dead-man last-alert timestamp invalid")
     return payload

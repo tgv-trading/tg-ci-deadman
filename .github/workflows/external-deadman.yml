@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: external-ci-deadman
@@ -21,6 +20,7 @@ jobs:
       - name: Run external heartbeat monitor
         env:
           DEADMAN_DISCORD_WEBHOOK: ${{ secrets.DEADMAN_DISCORD_WEBHOOK }}
+          DEADMAN_STATE_MESSAGE_ID: ${{ vars.DEADMAN_STATE_MESSAGE_ID }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail

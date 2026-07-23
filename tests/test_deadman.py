@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -55,11 +57,22 @@ class DeadmanTests(unittest.TestCase):
 
     def test_state_body_round_trips(self) -> None:
         body = check.state_body("degraded", 2_000_000_000, 1_999_999_999)
-        comment = {"id": 22, "body": body}
-        payload = check.parse_marker_payload(comment, check.STATE_MARKER)
+        payload = check.parse_marker_text(body, check.DISCORD_STATE_MARKER)
         self.assertEqual(payload["status"], "degraded")
         self.assertEqual(payload["last_alert_epoch"], 1_999_999_999)
+        self.assertEqual(payload["schema"], "tg_ci_deadman_state_v2")
         json.dumps(payload, sort_keys=True)
+
+    def test_discord_state_message_id_is_numeric(self) -> None:
+        with mock.patch.dict(os.environ, {"DEADMAN_STATE_MESSAGE_ID": "123456"}):
+            self.assertEqual(check.state_message_id(), "123456")
+        for value in ("", "not-numeric", "123/456"):
+            with self.subTest(value=value):
+                with mock.patch.dict(
+                    os.environ, {"DEADMAN_STATE_MESSAGE_ID": value}, clear=False
+                ):
+                    with self.assertRaises(RuntimeError):
+                        check.state_message_id()
 
     def test_discord_webhook_is_bounded_to_https_discord_endpoint(self) -> None:
         accepted = "https://discord.com/api/webhooks/123456/token-value"

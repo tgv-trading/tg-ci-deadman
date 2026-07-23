@@ -1,0 +1,31 @@
+name: quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download current revision without third-party actions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p scripts tests
+          for path in scripts/check-heartbeat.py scripts/publish-heartbeat.py tests/test_deadman.py; do
+            gh api "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${GITHUB_SHA}" --jq .content \
+              | base64 --decode > "${path}"
+          done
+      - name: Verify monitor
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -v
+          python3 -m compileall -q scripts tests

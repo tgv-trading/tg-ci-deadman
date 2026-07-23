@@ -89,6 +89,10 @@ class DeadmanTests(unittest.TestCase):
 
     def test_fresh_stale_and_future_heartbeat(self) -> None:
         self.assertEqual(
+            check.assess_heartbeat(heartbeat_payload(2_000_000_000), 2_000_000_000),
+            ("", 0),
+        )
+        self.assertEqual(
             check.assess_heartbeat(heartbeat_payload(2_000_000_000), 2_000_000_060),
             ("", 60),
         )
@@ -102,6 +106,11 @@ class DeadmanTests(unittest.TestCase):
         )
         self.assertIn("future", reason)
         self.assertEqual(age, -400)
+        reason, age = check.assess_heartbeat(
+            heartbeat_payload(2_000_000_001), 2_000_000_000
+        )
+        self.assertIn("future", reason)
+        self.assertEqual(age, -1)
 
     def test_malformed_heartbeat_contracts_are_rejected(self) -> None:
         malformed = (
@@ -142,6 +151,31 @@ class DeadmanTests(unittest.TestCase):
                 healthy_watchdog_state(completed_at=200),
                 healthy_watchdog_state(nonce="b" * 64),
                 {"probe_attestation": {**attestation_dict, "extra": True}},
+                {
+                    "probe_attestation": {
+                        **attestation_dict,
+                        "schema": "wrong",
+                    }
+                },
+                {
+                    "probe_attestation": {
+                        **attestation_dict,
+                        "source": "wrong",
+                    }
+                },
+                {
+                    "probe_attestation": {
+                        **attestation_dict,
+                        "status": "degraded",
+                    }
+                },
+                {
+                    "probe_attestation": {
+                        key: value
+                        for key, value in attestation_dict.items()
+                        if key != "completed_at"
+                    }
+                },
             )
             for candidate in invalid:
                 state.write_text(json.dumps(candidate), encoding="utf-8")
@@ -167,6 +201,80 @@ class DeadmanTests(unittest.TestCase):
                     probe_started_at=100,
                     now=100,
                 )
+
+    def test_successful_watchdog_without_state_write_never_patches_github(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            watchdog = Path(directory) / "watchdog.py"
+            state.write_text(
+                json.dumps(healthy_watchdog_state(nonce="b" * 64)), encoding="utf-8"
+            )
+            calls: list[list[str]] = []
+
+            def no_write(argv: list[str]) -> str:
+                calls.append(argv)
+                return ""
+
+            with (
+                mock.patch.object(publish, "run_command", side_effect=no_write),
+                mock.patch.object(
+                    publish.secrets, "token_hex", return_value=PROBE_NONCE
+                ),
+                mock.patch.object(publish.time, "time", side_effect=[100, 100]),
+                self.assertRaises(RuntimeError),
+            ):
+                publish.publish(watchdog, state)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], "python3")
+
+    def test_probe_nonce_is_unique_across_publications(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            watchdog = Path(directory) / "watchdog.py"
+            seen: list[str] = []
+
+            def fake_run(argv: list[str]) -> str:
+                if argv[0] == "python3":
+                    nonce = argv[argv.index("--probe-nonce") + 1]
+                    seen.append(nonce)
+                    state.write_text(
+                        json.dumps(healthy_watchdog_state(nonce=nonce)),
+                        encoding="utf-8",
+                    )
+                return ""
+
+            with (
+                mock.patch.object(publish, "run_command", side_effect=fake_run),
+                mock.patch.object(
+                    publish.secrets,
+                    "token_hex",
+                    side_effect=["a" * 64, "b" * 64],
+                ),
+                mock.patch.object(
+                    publish.time, "time", side_effect=[100, 100, 100, 100]
+                ),
+            ):
+                publish.publish(watchdog, state)
+                publish.publish(watchdog, state)
+            self.assertEqual(seen, ["a" * 64, "b" * 64])
+            self.assertNotEqual(seen[0], seen[1])
+
+    def test_command_failures_never_expose_nonce(self) -> None:
+        nonce = "c" * 64
+        argv = ["python3", "watchdog.py", "--probe-nonce", nonce]
+        failed = mock.Mock(returncode=1, stdout=nonce, stderr=nonce)
+        with mock.patch.object(publish.subprocess, "run", return_value=failed):
+            with self.assertRaises(RuntimeError) as failure:
+                publish.run_command(argv)
+        self.assertNotIn(nonce, str(failure.exception))
+
+        timeout = publish.subprocess.TimeoutExpired(
+            cmd=argv, timeout=45, output=nonce, stderr=nonce
+        )
+        with mock.patch.object(publish.subprocess, "run", side_effect=timeout):
+            with self.assertRaises(RuntimeError) as timed_out:
+                publish.run_command(argv)
+        self.assertNotIn(nonce, str(timed_out.exception))
 
     def test_publisher_always_runs_watchdog_into_selected_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -225,7 +333,7 @@ class DeadmanTests(unittest.TestCase):
             {**valid, "last_alert_epoch": now + 1},
             {**valid, "last_alert_epoch": now + 1, "last_check_epoch": now + 1},
             {**valid, "last_alert_epoch": -1},
-            {**valid, "last_check_epoch": now + check.MAX_FUTURE_SKEW_SECONDS + 1},
+            {**valid, "last_check_epoch": now + 1},
             {**valid, "schema": "wrong"},
             {**valid, "extra": True},
         )
@@ -251,6 +359,36 @@ class DeadmanTests(unittest.TestCase):
         send.assert_called_once()
         self.assertIn("integrity alert", send.call_args.args[0])
         update.assert_called_once()
+
+    def test_future_discord_state_cannot_suppress_integrity_alert(self) -> None:
+        now = 2_000_000_100
+        future = {
+            "last_alert_epoch": now + 1,
+            "last_check_epoch": now + 1,
+            "schema": check.STATE_SCHEMA,
+            "status": "degraded",
+        }
+
+        def load_future(current: int) -> dict[str, object]:
+            return check.normalize_state(future, current)
+
+        with (
+            mock.patch.object(check.time, "time", return_value=now),
+            mock.patch.object(
+                check,
+                "github_request",
+                return_value=heartbeat_comment(2_000_000_000),
+            ),
+            mock.patch.object(check, "load_discord_state", side_effect=load_future),
+            mock.patch.object(check, "send_discord") as send,
+            mock.patch.object(check, "update_discord_state") as update,
+            mock.patch("builtins.print"),
+        ):
+            self.assertEqual(check.main(), 1)
+        send.assert_called_once()
+        self.assertIn("integrity alert", send.call_args.args[0])
+        update.assert_called_once()
+        self.assertIn(f'"last_alert_epoch": {now}', update.call_args.args[0])
 
     def test_discord_state_message_id_is_numeric(self) -> None:
         with mock.patch.dict(os.environ, {"DEADMAN_STATE_MESSAGE_ID": "123456"}):

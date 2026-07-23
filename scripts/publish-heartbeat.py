@@ -69,18 +69,18 @@ def require_current_healthy_state(
 
 def run_command(argv: list[str]) -> str:
     # argv is locally constructed and is never interpreted by a shell.
-    completed = subprocess.run(  # nosec B603
-        argv,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=45,
-    )
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip().replace("\n", " ")
-        raise RuntimeError(
-            f"command_failed:{argv[0]}:{completed.returncode}:{detail[:240]}"
+    try:
+        completed = subprocess.run(  # nosec B603
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=45,
         )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("bounded command timed out") from None
+    if completed.returncode != 0:
+        raise RuntimeError("bounded command failed")
     return completed.stdout
 
 

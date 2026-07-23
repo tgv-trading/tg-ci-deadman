@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any
 import urllib.error
@@ -136,8 +137,8 @@ def validate_discord_webhook(value: str) -> str:
         or parsed.fragment
         or len(path_parts) != 5
         or path_parts[1:3] != ["api", "webhooks"]
-        or not path_parts[3].isdigit()
-        or not path_parts[4]
+        or re.fullmatch(r"[0-9]+", path_parts[3]) is None
+        or re.fullmatch(r"[A-Za-z0-9_-]{32,200}", path_parts[4]) is None
     ):
         raise ValueError("Discord webhook URL is outside the bounded HTTPS endpoint")
     return value
@@ -145,7 +146,7 @@ def validate_discord_webhook(value: str) -> str:
 
 def state_message_id() -> str:
     value = os.environ.get("DEADMAN_STATE_MESSAGE_ID", "")
-    if not value.isdigit():
+    if re.fullmatch(r"[0-9]+", value) is None:
         raise RuntimeError("Discord dead-man state message ID missing or invalid")
     return value
 

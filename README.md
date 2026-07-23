@@ -11,6 +11,7 @@ A trusted publisher updates one exact, identity-bound heartbeat comment only aft
 - No broker, IBKR, order, sizing, Risk Gate, execution, or performance-truth authority.
 - No secrets in repository files, logs, comments, or heartbeat payloads.
 - Pull-request workflows never receive the Discord webhook secret.
+- The secret-bearing workflow cannot be dispatched against pull-request branches; manual checks use a default-branch-only repository-dispatch event.
 - GitHub API and Discord webhook redirects are rejected.
 - Malformed heartbeat or private deduplication state fails closed and alerts.
 

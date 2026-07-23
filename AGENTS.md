@@ -15,5 +15,5 @@ This public repository contains only a sanitized external availability monitor f
 
 - Use short-lived branches and pull requests.
 - Run `python3 -m unittest discover -s tests -v`, `python3 -m compileall -q scripts tests`, and `git diff --check` before merge.
-- External monitoring runs only from the default branch on `schedule` or explicit `workflow_dispatch`.
+- External monitoring runs only from the default branch on `schedule` or the bounded `ci-deadman-manual` repository-dispatch event.
 - Pull requests run secret-free quality checks only.

@@ -19,8 +19,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p scripts tests
-          for path in scripts/check-heartbeat.py scripts/publish-heartbeat.py tests/test_deadman.py; do
+          mkdir -p scripts tests .github/workflows
+          for path in \
+            scripts/check-heartbeat.py \
+            scripts/publish-heartbeat.py \
+            tests/test_deadman.py \
+            .github/workflows/external-deadman.yml; do
             gh api "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${GITHUB_SHA}" --jq .content \
               | base64 --decode > "${path}"
           done

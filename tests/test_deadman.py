@@ -26,7 +26,8 @@ class DeadmanTests(unittest.TestCase):
         body = publish.heartbeat_body(2_000_000_000)
         self.assertIn(publish.HEARTBEAT_MARKER, body)
         self.assertIn('"epoch": 2000000000', body)
-        self.assertNotIn("sable", body.casefold())
+        payload = json.loads(body.split("```json", 1)[1].rsplit("```", 1)[0])
+        self.assertEqual(set(payload), {"epoch", "schema", "source"})
         self.assertNotIn("runner", body.casefold())
 
     def test_marker_lookup_and_payload_parse(self) -> None:

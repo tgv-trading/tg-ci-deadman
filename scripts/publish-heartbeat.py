@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish a sanitized heartbeat after the local CI watchdog reports healthy."""
+"""Publish a sanitized heartbeat after a current local CI watchdog probe."""
 
 from __future__ import annotations
 
@@ -10,17 +10,12 @@ from pathlib import Path
 # Fixed executable names and shell=False keep subprocess scope bounded.
 import subprocess  # nosec B404
 import time
-from typing import Any
+from typing import cast
 
 REPOSITORY = "tgv-trading/tg-ci-deadman"
-ISSUE_NUMBER = 2
+HEARTBEAT_COMMENT_ID = 5_055_931_210
 HEARTBEAT_MARKER = "<!-- tg-ci-heartbeat -->"
-DEFAULT_WATCHDOG = Path(
-    "/srv/gateways/terminal-gravity/scripts/tg-github-runner-watchdog.py"
-)
-DEFAULT_LOCAL_STATE = Path(
-    "/srv/gateways/terminal-gravity/state/tg-github-runner-watchdog.json"
-)
+MAX_LOCAL_FUTURE_SKEW_SECONDS = 5
 
 
 def heartbeat_body(now: int) -> str:
@@ -32,19 +27,27 @@ def heartbeat_body(now: int) -> str:
     return f"{HEARTBEAT_MARKER}\n```json\n{json.dumps(payload, sort_keys=True)}\n```"
 
 
-def find_marker_comment(comments: object, marker: str) -> dict[str, Any] | None:
-    if not isinstance(comments, list):
-        return None
-    for item in comments:
-        if isinstance(item, dict) and marker in str(item.get("body", "")):
-            return item
-    return None
-
-
-def require_healthy_state(path: Path) -> None:
+def require_current_healthy_state(
+    path: Path, *, probe_started_at: int, now: int
+) -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("status") != "healthy":
         raise RuntimeError("local CI watchdog is not healthy; heartbeat withheld")
+
+    started = payload.get("last_probe_started_at")
+    completed = payload.get("last_probe_completed_at")
+    healthy = payload.get("last_healthy_at")
+    epochs = (started, completed, healthy)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in epochs):
+        raise RuntimeError("local CI watchdog state timestamps are invalid")
+    started_epoch = cast(int, started)
+    completed_epoch = cast(int, completed)
+    healthy_epoch = cast(int, healthy)
+    if not (
+        probe_started_at <= started_epoch <= completed_epoch <= healthy_epoch
+        and completed_epoch <= now + MAX_LOCAL_FUTURE_SKEW_SECONDS
+    ):
+        raise RuntimeError("local CI watchdog state is not from the current probe")
 
 
 def run_command(argv: list[str]) -> str:
@@ -64,30 +67,20 @@ def run_command(argv: list[str]) -> str:
     return completed.stdout
 
 
-def publish(now: int, watchdog: Path, local_state: Path, skip_watchdog: bool) -> None:
-    if not skip_watchdog:
-        run_command(["python3", str(watchdog)])
-    require_healthy_state(local_state)
-    comments = json.loads(
-        run_command(
-            [
-                "gh",
-                "api",
-                f"repos/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments?per_page=100",
-            ]
-        )
+def publish(watchdog: Path, local_state: Path) -> None:
+    probe_started_at = int(time.time())
+    run_command(["python3", str(watchdog), "--state", str(local_state)])
+    now = int(time.time())
+    require_current_healthy_state(
+        local_state, probe_started_at=probe_started_at, now=now
     )
-    comment = find_marker_comment(comments, HEARTBEAT_MARKER)
-    comment_id = comment.get("id") if comment else None
-    if isinstance(comment_id, bool) or not isinstance(comment_id, int):
-        raise RuntimeError("heartbeat marker comment missing")
     run_command(
         [
             "gh",
             "api",
             "--method",
             "PATCH",
-            f"repos/{REPOSITORY}/issues/comments/{comment_id}",
+            f"repos/{REPOSITORY}/issues/comments/{HEARTBEAT_COMMENT_ID}",
             "-f",
             f"body={heartbeat_body(now)}",
         ]
@@ -96,17 +89,14 @@ def publish(now: int, watchdog: Path, local_state: Path, skip_watchdog: bool) ->
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--watchdog", type=Path, default=DEFAULT_WATCHDOG)
-    parser.add_argument("--local-state", type=Path, default=DEFAULT_LOCAL_STATE)
-    parser.add_argument("--now", type=int)
-    parser.add_argument("--skip-watchdog", action="store_true")
+    parser.add_argument("--watchdog", type=Path, required=True)
+    parser.add_argument("--local-state", type=Path, required=True)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    now = args.now if args.now is not None else int(time.time())
-    publish(now, args.watchdog, args.local_state, args.skip_watchdog)
+    publish(args.watchdog, args.local_state)
     return 0
 
 

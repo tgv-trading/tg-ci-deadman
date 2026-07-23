@@ -4,6 +4,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -23,45 +25,194 @@ check = load("check_heartbeat", "scripts/check-heartbeat.py")
 publish = load("publish_heartbeat", "scripts/publish-heartbeat.py")
 
 
+def heartbeat_payload(epoch: int) -> dict[str, object]:
+    return {
+        "epoch": epoch,
+        "schema": check.HEARTBEAT_SCHEMA,
+        "source": check.HEARTBEAT_SOURCE,
+    }
+
+
+def heartbeat_comment(epoch: int) -> dict[str, object]:
+    return {
+        "id": check.HEARTBEAT_COMMENT_ID,
+        "issue_url": (
+            f"https://api.github.com/repos/{check.REPOSITORY}/issues/"
+            f"{check.ISSUE_NUMBER}"
+        ),
+        "user": {"login": check.HEARTBEAT_COMMENT_AUTHOR},
+        "body": publish.heartbeat_body(epoch),
+    }
+
+
 class DeadmanTests(unittest.TestCase):
     def test_publisher_body_contains_only_sanitized_contract(self) -> None:
         body = publish.heartbeat_body(2_000_000_000)
         self.assertIn(publish.HEARTBEAT_MARKER, body)
-        self.assertIn('"epoch": 2000000000', body)
         payload = json.loads(body.split("```json", 1)[1].rsplit("```", 1)[0])
-        self.assertEqual(set(payload), {"epoch", "schema", "source"})
+        self.assertEqual(set(payload), check.HEARTBEAT_KEYS)
+        self.assertEqual(payload["schema"], check.HEARTBEAT_SCHEMA)
+        self.assertEqual(payload["source"], check.HEARTBEAT_SOURCE)
         self.assertNotIn("runner", body.casefold())
 
-    def test_marker_lookup_and_payload_parse(self) -> None:
-        comment = {"id": 11, "body": publish.heartbeat_body(2_000_000_000)}
-        found = check.find_marker_comment([comment], check.HEARTBEAT_MARKER)
-        payload = check.parse_marker_payload(found, check.HEARTBEAT_MARKER)
+    def test_exact_heartbeat_comment_identity_and_payload(self) -> None:
+        payload = check.validate_heartbeat_comment(heartbeat_comment(2_000_000_000))
         self.assertEqual(payload["epoch"], 2_000_000_000)
+        for field, value in (
+            ("id", 999),
+            ("issue_url", "https://api.github.com/repos/example/other/issues/2"),
+            ("user", {"login": "someone-else"}),
+        ):
+            with self.subTest(field=field):
+                candidate = heartbeat_comment(2_000_000_000)
+                candidate[field] = value
+                with self.assertRaises(ValueError):
+                    check.validate_heartbeat_comment(candidate)
 
     def test_fresh_stale_and_future_heartbeat(self) -> None:
         self.assertEqual(
-            check.assess_heartbeat({"epoch": 2_000_000_000}, 2_000_000_060), ("", 60)
+            check.assess_heartbeat(heartbeat_payload(2_000_000_000), 2_000_000_060),
+            ("", 60),
         )
-        reason, age = check.assess_heartbeat({"epoch": 2_000_000_000}, 2_000_001_201)
+        reason, age = check.assess_heartbeat(
+            heartbeat_payload(2_000_000_000), 2_000_001_201
+        )
         self.assertIn("stale", reason)
         self.assertEqual(age, 1201)
-        reason, age = check.assess_heartbeat({"epoch": 2_000_000_400}, 2_000_000_000)
+        reason, age = check.assess_heartbeat(
+            heartbeat_payload(2_000_000_400), 2_000_000_000
+        )
         self.assertIn("future", reason)
         self.assertEqual(age, -400)
 
-    def test_bool_and_non_positive_epochs_are_rejected(self) -> None:
+    def test_malformed_heartbeat_contracts_are_rejected(self) -> None:
+        malformed = (
+            {"epoch": 2_000_000_000},
+            {**heartbeat_payload(2_000_000_000), "private": "data"},
+            {**heartbeat_payload(2_000_000_000), "schema": "wrong"},
+            {**heartbeat_payload(2_000_000_000), "source": "wrong"},
+        )
+        for payload in malformed:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    check.assess_heartbeat(payload, 2_000_000_060)
         for epoch in (True, False, 0, -1, "2000000000", 1.5, None):
             with self.subTest(epoch=epoch):
+                payload = heartbeat_payload(2_000_000_000)
+                payload["epoch"] = epoch
                 with self.assertRaises(ValueError):
-                    check.assess_heartbeat({"epoch": epoch}, 2_000_000_000)
+                    check.assess_heartbeat(payload, 2_000_000_000)
 
-    def test_state_body_round_trips(self) -> None:
-        body = check.state_body("degraded", 2_000_000_000, 1_999_999_999)
-        payload = check.parse_marker_text(body, check.DISCORD_STATE_MARKER)
-        self.assertEqual(payload["status"], "degraded")
-        self.assertEqual(payload["last_alert_epoch"], 1_999_999_999)
-        self.assertEqual(payload["schema"], "tg_ci_deadman_state_v2")
-        json.dumps(payload, sort_keys=True)
+    def test_current_watchdog_state_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            valid = {
+                "status": "healthy",
+                "last_probe_started_at": 100,
+                "last_probe_completed_at": 100,
+                "last_healthy_at": 100,
+            }
+            state.write_text(json.dumps(valid), encoding="utf-8")
+            publish.require_current_healthy_state(state, probe_started_at=100, now=101)
+            for mutation in (
+                {"last_probe_completed_at": 99},
+                {"last_probe_completed_at": 200},
+                {"status": "degraded"},
+            ):
+                candidate = {**valid, **mutation}
+                state.write_text(json.dumps(candidate), encoding="utf-8")
+                with self.subTest(mutation=mutation):
+                    with self.assertRaises(RuntimeError):
+                        publish.require_current_healthy_state(
+                            state, probe_started_at=100, now=101
+                        )
+
+    def test_publisher_always_runs_watchdog_into_selected_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            watchdog = Path(directory) / "watchdog.py"
+            calls: list[list[str]] = []
+
+            def fake_run(argv: list[str]) -> str:
+                calls.append(argv)
+                if argv[0] == "python3":
+                    state.write_text(
+                        json.dumps(
+                            {
+                                "status": "healthy",
+                                "last_probe_started_at": 100,
+                                "last_probe_completed_at": 100,
+                                "last_healthy_at": 100,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                return ""
+
+            with (
+                mock.patch.object(publish, "run_command", side_effect=fake_run),
+                mock.patch.object(publish.time, "time", side_effect=[100, 101]),
+            ):
+                publish.publish(watchdog, state)
+            self.assertEqual(
+                calls[0], ["python3", str(watchdog), "--state", str(state)]
+            )
+            self.assertIn(str(publish.HEARTBEAT_COMMENT_ID), calls[1][4])
+
+    def test_cli_has_no_watchdog_bypass(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "publish-heartbeat",
+                "--watchdog",
+                "watch.py",
+                "--local-state",
+                "state.json",
+            ],
+        ):
+            args = publish.parse_args()
+        self.assertFalse(hasattr(args, "skip_watchdog"))
+        self.assertEqual(args.watchdog, Path("watch.py"))
+
+    def test_state_contract_rejects_future_or_malformed_alert_time(self) -> None:
+        now = 2_000_000_000
+        valid = {
+            "last_alert_epoch": now - 10,
+            "last_check_epoch": now,
+            "schema": check.STATE_SCHEMA,
+            "status": "degraded",
+        }
+        self.assertEqual(check.normalize_state(valid, now), valid)
+        malformed = (
+            {**valid, "last_alert_epoch": now + 1},
+            {**valid, "last_alert_epoch": -1},
+            {**valid, "last_check_epoch": now + check.MAX_FUTURE_SKEW_SECONDS + 1},
+            {**valid, "schema": "wrong"},
+            {**valid, "extra": True},
+        )
+        for payload in malformed:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    check.normalize_state(payload, now)
+
+    def test_invalid_state_causes_integrity_alert_and_failed_check(self) -> None:
+        with (
+            mock.patch.object(check.time, "time", return_value=2_000_000_100),
+            mock.patch.object(
+                check,
+                "github_request",
+                return_value=heartbeat_comment(2_000_000_000),
+            ),
+            mock.patch.object(check, "load_discord_state", side_effect=ValueError),
+            mock.patch.object(check, "send_discord") as send,
+            mock.patch.object(check, "update_discord_state") as update,
+            mock.patch("builtins.print"),
+        ):
+            self.assertEqual(check.main(), 1)
+        send.assert_called_once()
+        self.assertIn("integrity alert", send.call_args.args[0])
+        update.assert_called_once()
 
     def test_discord_state_message_id_is_numeric(self) -> None:
         with mock.patch.dict(os.environ, {"DEADMAN_STATE_MESSAGE_ID": "123456"}):
@@ -74,7 +225,7 @@ class DeadmanTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         check.state_message_id()
 
-    def test_discord_webhook_is_bounded_to_https_discord_endpoint(self) -> None:
+    def test_discord_webhook_and_redirect_policy_are_fail_closed(self) -> None:
         accepted = "https://discord.com/api/webhooks/123456/token-value"
         self.assertEqual(check.validate_discord_webhook(accepted), accepted)
         rejected = (
@@ -89,6 +240,17 @@ class DeadmanTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     check.validate_discord_webhook(value)
+        handler = check.NoRedirectHandler()
+        self.assertIsNone(
+            handler.redirect_request(
+                mock.Mock(),
+                mock.Mock(),
+                302,
+                "Found",
+                mock.Mock(),
+                "http://127.0.0.1/internal",
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -217,7 +217,7 @@ class DeadmanTests(unittest.TestCase):
     def test_discord_state_message_id_is_numeric(self) -> None:
         with mock.patch.dict(os.environ, {"DEADMAN_STATE_MESSAGE_ID": "123456"}):
             self.assertEqual(check.state_message_id(), "123456")
-        for value in ("", "not-numeric", "123/456"):
+        for value in ("", "not-numeric", "123/456", "１２３", "١٢٣"):
             with self.subTest(value=value):
                 with mock.patch.dict(
                     os.environ, {"DEADMAN_STATE_MESSAGE_ID": value}, clear=False
@@ -226,13 +226,20 @@ class DeadmanTests(unittest.TestCase):
                         check.state_message_id()
 
     def test_discord_webhook_and_redirect_policy_are_fail_closed(self) -> None:
-        accepted = "https://discord.com/api/webhooks/123456/token-value"
+        accepted = (
+            "https://discord.com/api/webhooks/123456/"
+            "abcdefghijklmnopqrstuvwxyz_ABCD-123456"
+        )
         self.assertEqual(check.validate_discord_webhook(accepted), accepted)
         rejected = (
             "http://discord.com/api/webhooks/123/token",
             "https://example.com/api/webhooks/123/token",
             "file:///tmp/secret",
             "https://discord.com/api/webhooks/not-numeric/token",
+            "https://discord.com/api/webhooks/１２３/abcdefghijklmnopqrstuvwxyz_ABCD-123456",
+            "https://discord.com/api/webhooks/123/..",
+            "https://discord.com/api/webhooks/123/%2F",
+            "https://discord.com/api/webhooks/123/short-token",
             "https://discord.com/api/webhooks/123/token?redirect=example",
             "https://discord.com/api/webhooks/123/token/extra",
         )
@@ -251,6 +258,16 @@ class DeadmanTests(unittest.TestCase):
                 "http://127.0.0.1/internal",
             )
         )
+
+    def test_secret_workflow_cannot_run_pull_request_head_code(self) -> None:
+        workflow = (ROOT / ".github/workflows/external-deadman.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("workflow_dispatch:", workflow)
+        self.assertNotIn("pull_request", workflow)
+        self.assertIn("repository_dispatch:", workflow)
+        self.assertIn("types: [ci-deadman-manual]", workflow)
+        self.assertIn("if: github.ref == 'refs/heads/main'", workflow)
 
 
 if __name__ == "__main__":

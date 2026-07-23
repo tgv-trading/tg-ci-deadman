@@ -3,7 +3,8 @@ name: external-ci-deadman
 on:
   schedule:
     - cron: "*/5 * * * *"
-  workflow_dispatch:
+  repository_dispatch:
+    types: [ci-deadman-manual]
 
 permissions:
   contents: read
@@ -14,6 +15,7 @@ concurrency:
 
 jobs:
   monitor:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

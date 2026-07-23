@@ -13,11 +13,36 @@ import urllib.request
 
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "tgv-trading/tg-ci-deadman")
 ISSUE_NUMBER = 2
+HEARTBEAT_COMMENT_ID = 5_055_931_210
+HEARTBEAT_COMMENT_AUTHOR = "TerminalGravity"
 HEARTBEAT_MARKER = "<!-- tg-ci-heartbeat -->"
+HEARTBEAT_SCHEMA = "tg_ci_deadman_v1"
+HEARTBEAT_SOURCE = "self_hosted_ci_health"
+HEARTBEAT_KEYS = {"epoch", "schema", "source"}
 DISCORD_STATE_MARKER = "Terminal Gravity CI dead-man state"
+STATE_SCHEMA = "tg_ci_deadman_state_v2"
+STATE_KEYS = {"last_alert_epoch", "last_check_epoch", "schema", "status"}
 MAX_HEARTBEAT_AGE_SECONDS = 20 * 60
 MAX_FUTURE_SKEW_SECONDS = 5 * 60
 REPEAT_ALERT_SECONDS = 6 * 60 * 60
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirects so bounded requests cannot be redirected off-origin."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+NO_REDIRECT_OPENER = urllib.request.build_opener(NoRedirectHandler())
 
 
 def github_request(path: str) -> Any:
@@ -33,19 +58,10 @@ def github_request(path: str) -> Any:
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    # The URL origin is fixed to api.github.com; only the repository API path varies.
-    with urllib.request.urlopen(request, timeout=30) as response:  # nosec B310
+    # The URL origin is fixed and redirects are rejected by the bounded opener.
+    with NO_REDIRECT_OPENER.open(request, timeout=30) as response:  # nosec B310
         body = response.read()
     return json.loads(body) if body else None
-
-
-def find_marker_comment(comments: object, marker: str) -> dict[str, Any] | None:
-    if not isinstance(comments, list):
-        return None
-    for item in comments:
-        if isinstance(item, dict) and marker in str(item.get("body", "")):
-            return item
-    return None
 
 
 def parse_marker_text(body: object, marker: str) -> dict[str, Any]:
@@ -60,13 +76,30 @@ def parse_marker_text(body: object, marker: str) -> dict[str, Any]:
     return payload
 
 
-def parse_marker_payload(comment: dict[str, Any] | None, marker: str) -> dict[str, Any]:
-    if comment is None:
-        raise ValueError("marker comment missing")
-    return parse_marker_text(comment.get("body"), marker)
+def validate_heartbeat_comment(comment: object) -> dict[str, Any]:
+    if not isinstance(comment, dict):
+        raise ValueError("heartbeat comment response invalid")
+    user = comment.get("user")
+    expected_issue_url = (
+        f"https://api.github.com/repos/{REPOSITORY}/issues/{ISSUE_NUMBER}"
+    )
+    if (
+        comment.get("id") != HEARTBEAT_COMMENT_ID
+        or comment.get("issue_url") != expected_issue_url
+        or not isinstance(user, dict)
+        or user.get("login") != HEARTBEAT_COMMENT_AUTHOR
+    ):
+        raise ValueError("heartbeat comment identity invalid")
+    return parse_marker_text(comment.get("body"), HEARTBEAT_MARKER)
 
 
 def assess_heartbeat(payload: dict[str, Any], now: int) -> tuple[str, int]:
+    if set(payload) != HEARTBEAT_KEYS:
+        raise ValueError("heartbeat fields invalid")
+    if payload.get("schema") != HEARTBEAT_SCHEMA:
+        raise ValueError("heartbeat schema invalid")
+    if payload.get("source") != HEARTBEAT_SOURCE:
+        raise ValueError("heartbeat source invalid")
     epoch = payload.get("epoch")
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
         raise ValueError("heartbeat epoch invalid")
@@ -82,7 +115,7 @@ def state_body(status: str, now: int, last_alert_epoch: int) -> str:
     payload = {
         "last_alert_epoch": last_alert_epoch,
         "last_check_epoch": now,
-        "schema": "tg_ci_deadman_state_v2",
+        "schema": STATE_SCHEMA,
         "status": status,
     }
     return (
@@ -135,8 +168,8 @@ def discord_request(
         method=method,
         headers={"Content-Type": "application/json", "User-Agent": "tg-ci-deadman"},
     )
-    # validate_discord_webhook constrains the base URL to Discord's HTTPS origin.
-    with urllib.request.urlopen(request, timeout=30) as response:  # nosec B310
+    # The webhook origin is validated and redirects are rejected.
+    with NO_REDIRECT_OPENER.open(request, timeout=30) as response:  # nosec B310
         body = response.read()
         if response.status not in {200, 204}:
             raise RuntimeError(f"Discord webhook returned HTTP {response.status}")
@@ -147,11 +180,37 @@ def send_discord(content: str) -> None:
     discord_request(method="POST", payload={"content": content})
 
 
-def load_discord_state() -> dict[str, Any]:
+def normalize_state(payload: dict[str, Any], now: int) -> dict[str, Any]:
+    if set(payload) != STATE_KEYS or payload.get("schema") != STATE_SCHEMA:
+        raise ValueError("dead-man state contract invalid")
+    if payload.get("status") not in {"healthy", "degraded"}:
+        raise ValueError("dead-man state status invalid")
+    last_check = payload.get("last_check_epoch")
+    last_alert = payload.get("last_alert_epoch")
+    if (
+        isinstance(last_check, bool)
+        or not isinstance(last_check, int)
+        or last_check <= 0
+        or last_check > now + MAX_FUTURE_SKEW_SECONDS
+    ):
+        raise ValueError("dead-man last-check timestamp invalid")
+    if (
+        isinstance(last_alert, bool)
+        or not isinstance(last_alert, int)
+        or last_alert < 0
+        or last_alert > last_check
+        or last_alert > now + MAX_FUTURE_SKEW_SECONDS
+    ):
+        raise ValueError("dead-man last-alert timestamp invalid")
+    return payload
+
+
+def load_discord_state(now: int) -> dict[str, Any]:
     message = discord_request(method="GET", state_message=True)
     if not isinstance(message, dict):
         raise RuntimeError("Discord dead-man state response invalid")
-    return parse_marker_text(message.get("content"), DISCORD_STATE_MARKER)
+    payload = parse_marker_text(message.get("content"), DISCORD_STATE_MARKER)
+    return normalize_state(payload, now)
 
 
 def update_discord_state(body: str) -> None:
@@ -160,19 +219,35 @@ def update_discord_state(body: str) -> None:
 
 def main() -> int:
     now = int(time.time())
-    comments = github_request(
-        f"/repos/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments?per_page=100"
-    )
-    heartbeat_comment = find_marker_comment(comments, HEARTBEAT_MARKER)
-
     try:
-        heartbeat = parse_marker_payload(heartbeat_comment, HEARTBEAT_MARKER)
+        heartbeat_comment = github_request(
+            f"/repos/{REPOSITORY}/issues/comments/{HEARTBEAT_COMMENT_ID}"
+        )
+        heartbeat = validate_heartbeat_comment(heartbeat_comment)
         reason, age = assess_heartbeat(heartbeat, now)
-    except (ValueError, TypeError, json.JSONDecodeError) as exc:
-        reason = f"heartbeat invalid: {type(exc).__name__}: {exc}"
+    except (
+        ValueError,
+        TypeError,
+        RuntimeError,
+        json.JSONDecodeError,
+        urllib.error.URLError,
+    ) as exc:
+        reason = f"heartbeat unavailable or invalid: {type(exc).__name__}"
         age = -1
 
-    prior = load_discord_state()
+    state_invalid = False
+    try:
+        prior = load_discord_state(now)
+    except (
+        ValueError,
+        TypeError,
+        RuntimeError,
+        json.JSONDecodeError,
+        urllib.error.URLError,
+    ):
+        prior = {"status": "unknown", "last_alert_epoch": 0}
+        state_invalid = True
+
     prior_status = prior.get("status")
     last_alert = prior.get("last_alert_epoch")
     if isinstance(last_alert, bool) or not isinstance(last_alert, int):
@@ -180,7 +255,8 @@ def main() -> int:
 
     if reason:
         should_alert = (
-            prior_status != "degraded"
+            state_invalid
+            or prior_status != "degraded"
             or last_alert == 0
             or now - last_alert >= REPEAT_ALERT_SECONDS
         )
@@ -193,6 +269,15 @@ def main() -> int:
             last_alert = now
         update_discord_state(state_body("degraded", now, last_alert))
         print(json.dumps({"status": "degraded", "reason": reason, "age_seconds": age}))
+        return 1
+
+    if state_invalid:
+        send_discord(
+            "Terminal Gravity external CI dead-man integrity alert: "
+            "the private deduplication state was invalid and has been reset."
+        )
+        update_discord_state(state_body("healthy", now, now))
+        print(json.dumps({"status": "degraded", "reason": "state invalid and reset"}))
         return 1
 
     if prior_status == "degraded":

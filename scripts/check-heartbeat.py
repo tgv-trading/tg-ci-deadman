@@ -192,7 +192,7 @@ def normalize_state(payload: dict[str, Any], now: int) -> dict[str, Any]:
         isinstance(last_check, bool)
         or not isinstance(last_check, int)
         or last_check <= 0
-        or last_check > now + MAX_FUTURE_SKEW_SECONDS
+        or last_check > now
     ):
         raise ValueError("dead-man last-check timestamp invalid")
     if (
@@ -200,7 +200,7 @@ def normalize_state(payload: dict[str, Any], now: int) -> dict[str, Any]:
         or not isinstance(last_alert, int)
         or last_alert < 0
         or last_alert > last_check
-        or last_alert > now + MAX_FUTURE_SKEW_SECONDS
+        or last_alert > now
     ):
         raise ValueError("dead-man last-alert timestamp invalid")
     return payload

@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
+import secrets
 
 # Fixed executable names and shell=False keep subprocess scope bounded.
 import subprocess  # nosec B404
@@ -15,7 +17,16 @@ from typing import cast
 REPOSITORY = "tgv-trading/tg-ci-deadman"
 HEARTBEAT_COMMENT_ID = 5_055_931_210
 HEARTBEAT_MARKER = "<!-- tg-ci-heartbeat -->"
-MAX_LOCAL_FUTURE_SKEW_SECONDS = 5
+PROBE_ATTESTATION_SCHEMA = "tg_ci_watchdog_probe_v1"
+PROBE_ATTESTATION_SOURCE = "local_self_hosted_ci_watchdog"
+PROBE_ATTESTATION_KEYS = {
+    "completed_at",
+    "nonce",
+    "schema",
+    "source",
+    "started_at",
+    "status",
+}
 
 
 def heartbeat_body(now: int) -> str:
@@ -28,25 +39,31 @@ def heartbeat_body(now: int) -> str:
 
 
 def require_current_healthy_state(
-    path: Path, *, probe_started_at: int, now: int
+    path: Path, *, expected_nonce: str, probe_started_at: int, now: int
 ) -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.get("status") != "healthy":
+    if not isinstance(payload, dict):
         raise RuntimeError("local CI watchdog is not healthy; heartbeat withheld")
+    attestation = payload.get("probe_attestation")
+    if not isinstance(attestation, dict) or set(attestation) != PROBE_ATTESTATION_KEYS:
+        raise RuntimeError("local CI watchdog probe attestation is invalid")
+    if (
+        attestation.get("schema") != PROBE_ATTESTATION_SCHEMA
+        or attestation.get("source") != PROBE_ATTESTATION_SOURCE
+        or attestation.get("status") != "healthy"
+        or attestation.get("nonce") != expected_nonce
+        or re.fullmatch(r"[a-f0-9]{64}", expected_nonce) is None
+    ):
+        raise RuntimeError("local CI watchdog probe identity is invalid")
 
-    started = payload.get("last_probe_started_at")
-    completed = payload.get("last_probe_completed_at")
-    healthy = payload.get("last_healthy_at")
-    epochs = (started, completed, healthy)
+    started = attestation.get("started_at")
+    completed = attestation.get("completed_at")
+    epochs = (started, completed)
     if any(isinstance(value, bool) or not isinstance(value, int) for value in epochs):
         raise RuntimeError("local CI watchdog state timestamps are invalid")
     started_epoch = cast(int, started)
     completed_epoch = cast(int, completed)
-    healthy_epoch = cast(int, healthy)
-    if not (
-        probe_started_at <= started_epoch <= completed_epoch <= healthy_epoch
-        and completed_epoch <= now + MAX_LOCAL_FUTURE_SKEW_SECONDS
-    ):
+    if not (probe_started_at <= started_epoch <= completed_epoch <= now):
         raise RuntimeError("local CI watchdog state is not from the current probe")
 
 
@@ -68,11 +85,24 @@ def run_command(argv: list[str]) -> str:
 
 
 def publish(watchdog: Path, local_state: Path) -> None:
+    probe_nonce = secrets.token_hex(32)
     probe_started_at = int(time.time())
-    run_command(["python3", str(watchdog), "--state", str(local_state)])
+    run_command(
+        [
+            "python3",
+            str(watchdog),
+            "--state",
+            str(local_state),
+            "--probe-nonce",
+            probe_nonce,
+        ]
+    )
     now = int(time.time())
     require_current_healthy_state(
-        local_state, probe_started_at=probe_started_at, now=now
+        local_state,
+        expected_nonce=probe_nonce,
+        probe_started_at=probe_started_at,
+        now=now,
     )
     run_command(
         [

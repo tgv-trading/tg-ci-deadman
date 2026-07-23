@@ -45,6 +45,24 @@ def heartbeat_comment(epoch: int) -> dict[str, object]:
     }
 
 
+PROBE_NONCE = "a" * 64
+
+
+def healthy_watchdog_state(
+    started_at: int = 100, completed_at: int = 100, nonce: str = PROBE_NONCE
+) -> dict[str, object]:
+    return {
+        "probe_attestation": {
+            "completed_at": completed_at,
+            "nonce": nonce,
+            "schema": publish.PROBE_ATTESTATION_SCHEMA,
+            "source": publish.PROBE_ATTESTATION_SOURCE,
+            "started_at": started_at,
+            "status": "healthy",
+        }
+    }
+
+
 class DeadmanTests(unittest.TestCase):
     def test_publisher_body_contains_only_sanitized_contract(self) -> None:
         body = publish.heartbeat_body(2_000_000_000)
@@ -106,26 +124,49 @@ class DeadmanTests(unittest.TestCase):
     def test_current_watchdog_state_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state.json"
-            valid = {
-                "status": "healthy",
-                "last_probe_started_at": 100,
-                "last_probe_completed_at": 100,
-                "last_healthy_at": 100,
-            }
+            valid = healthy_watchdog_state()
             state.write_text(json.dumps(valid), encoding="utf-8")
-            publish.require_current_healthy_state(state, probe_started_at=100, now=101)
-            for mutation in (
-                {"last_probe_completed_at": 99},
-                {"last_probe_completed_at": 200},
-                {"status": "degraded"},
-            ):
-                candidate = {**valid, **mutation}
+            publish.require_current_healthy_state(
+                state,
+                expected_nonce=PROBE_NONCE,
+                probe_started_at=100,
+                now=101,
+            )
+            attestation = valid["probe_attestation"]
+            self.assertIsInstance(attestation, dict)
+            attestation_dict = (
+                dict(attestation) if isinstance(attestation, dict) else {}
+            )
+            invalid = (
+                healthy_watchdog_state(completed_at=99),
+                healthy_watchdog_state(completed_at=200),
+                healthy_watchdog_state(nonce="b" * 64),
+                {"probe_attestation": {**attestation_dict, "extra": True}},
+            )
+            for candidate in invalid:
                 state.write_text(json.dumps(candidate), encoding="utf-8")
-                with self.subTest(mutation=mutation):
+                with self.subTest(candidate=candidate):
                     with self.assertRaises(RuntimeError):
                         publish.require_current_healthy_state(
-                            state, probe_started_at=100, now=101
+                            state,
+                            expected_nonce=PROBE_NONCE,
+                            probe_started_at=100,
+                            now=101,
                         )
+
+    def test_stale_same_second_watchdog_state_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            state.write_text(
+                json.dumps(healthy_watchdog_state(nonce="b" * 64)), encoding="utf-8"
+            )
+            with self.assertRaises(RuntimeError):
+                publish.require_current_healthy_state(
+                    state,
+                    expected_nonce=PROBE_NONCE,
+                    probe_started_at=100,
+                    now=100,
+                )
 
     def test_publisher_always_runs_watchdog_into_selected_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -136,15 +177,9 @@ class DeadmanTests(unittest.TestCase):
             def fake_run(argv: list[str]) -> str:
                 calls.append(argv)
                 if argv[0] == "python3":
+                    nonce = argv[argv.index("--probe-nonce") + 1]
                     state.write_text(
-                        json.dumps(
-                            {
-                                "status": "healthy",
-                                "last_probe_started_at": 100,
-                                "last_probe_completed_at": 100,
-                                "last_healthy_at": 100,
-                            }
-                        ),
+                        json.dumps(healthy_watchdog_state(nonce=nonce)),
                         encoding="utf-8",
                     )
                 return ""
@@ -155,8 +190,10 @@ class DeadmanTests(unittest.TestCase):
             ):
                 publish.publish(watchdog, state)
             self.assertEqual(
-                calls[0], ["python3", str(watchdog), "--state", str(state)]
+                calls[0][:4], ["python3", str(watchdog), "--state", str(state)]
             )
+            self.assertEqual(calls[0][4], "--probe-nonce")
+            self.assertRegex(calls[0][5], r"^[a-f0-9]{64}$")
             self.assertIn(str(publish.HEARTBEAT_COMMENT_ID), calls[1][4])
 
     def test_cli_has_no_watchdog_bypass(self) -> None:
@@ -186,6 +223,7 @@ class DeadmanTests(unittest.TestCase):
         self.assertEqual(check.normalize_state(valid, now), valid)
         malformed = (
             {**valid, "last_alert_epoch": now + 1},
+            {**valid, "last_alert_epoch": now + 1, "last_check_epoch": now + 1},
             {**valid, "last_alert_epoch": -1},
             {**valid, "last_check_epoch": now + check.MAX_FUTURE_SKEW_SECONDS + 1},
             {**valid, "schema": "wrong"},

@@ -4,6 +4,25 @@ Public, sanitized dead-man monitoring for the Terminal Gravity self-hosted CI ru
 
 A trusted publisher updates one exact, identity-bound heartbeat comment only after a watchdog probe from the same invocation reports healthy with a matching cryptographic nonce attestation. A GitHub-hosted scheduled workflow, independent of the self-hosted machine, validates the exact heartbeat schema and alerts a bounded Discord webhook when the heartbeat is stale or malformed. It announces recovery when the heartbeat becomes healthy again. Alert deduplication state lives in one message owned by the same scoped webhook, so the workflow's GitHub token remains read-only.
 
+## Repository map
+
+- `scripts/check-heartbeat.py` — validates the public heartbeat and manages bounded Discord alert state.
+- `scripts/publish-heartbeat.py` — publishes only after a current, nonce-bound local watchdog attestation.
+- `tests/test_deadman.py` — secret-free contract, failure-mode, and workflow safety tests.
+- `.github/workflows/quality.yml` — pull-request and main-branch validation.
+- `.github/workflows/external-deadman.yml` — default-branch external monitor.
+- `AGENTS.md` — contributor safety boundaries and required checks.
+
+## Local validation
+
+The project uses only the Python standard library. Run the same checks documented for contributors with:
+
+```bash
+./scripts/check.sh
+```
+
+Equivalent direct commands are `python3 -m unittest discover -s tests -v` and `python3 -m compileall -q scripts tests`.
+
 ## Boundaries
 
 - No private source code or private GitHub metadata.
